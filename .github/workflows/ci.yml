@@ -1,0 +1,46 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build simulation and unit tests
+        run: |
+          cmake -B build
+          cmake --build build -j4
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Fault injection scenarios (short version)
+        run: python3 tools/run_scenarios.py --quick
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim-results
+          path: results/
+
+  stm32:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM toolchain and QEMU
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi qemu-system-arm
+      - name: Build firmware for the real board
+        run: |
+          cmake -B build-arm -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake
+          cmake --build build-arm -j4
+      - name: Run firmware in QEMU and check the log
+        run: bash tools/run_qemu.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firmware
+          path: |
+            build-arm/firmware.elf
+            build-arm/firmware.bin
+            build-arm/firmware.map
+            results/qemu/

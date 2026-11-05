@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Runs all test scenarios on the Linux simulation and writes a summary.
+
+usage: python3 tools/run_scenarios.py [--build build] [--quick]
+
+--quick makes every run short (for CI). The numbers in docs/RESULTS.md
+come from a full run (without --quick).
+Raw console output and binary logs go to results/<scenario>/.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+
+def scenarios(quick):
+    long_s = 30 if quick else 600
+    mid_s = 20 if quick else 120
+    return [
+        # name, args, expected exit code, description
+        ("baseline", ["--duration", str(long_s)], 0,
+         f"{long_s} s, no faults"),
+        ("stall_300ms_every_2s", ["--duration", str(mid_s), "--periodic-stall", "2000:300"], 0,
+         "300 ms storage stall every 2 s"),
+        ("stall_900ms_every_3s", ["--duration", str(mid_s), "--periodic-stall", "3000:900"], 0,
+         "900 ms storage stall every 3 s (just under the 1 s queue)"),
+        ("stall_1500ms_once", ["--duration", "30", "--at", "10000:stall 1500"], 0,
+         "one 1500 ms stall (longer than the queue can hold)"),
+        ("stall_1900ms_once", ["--duration", "30", "--at", "10000:stall 1900"], 0,
+         "one 1900 ms stall (just under the 2 s heartbeat timeout)"),
+        ("stall_3000ms_once", ["--duration", "30", "--at", "10000:stall 3000"], 3,
+         "one 3000 ms stall: logger silent > 2 s, treated as hung -> reset"),
+        ("fault_hang", ["--duration", "30", "--at", "10000:hang"], 3,
+         "logger blocks forever -> health detects -> watchdog reset"),
+        ("fault_spin", ["--duration", "30", "--at", "10000:spin"], 3,
+         "logger loops forever -> health starved -> watchdog reset"),
+    ]
+
+
+def run_sim(build, name, args, expected_rc):
+    out_dir = os.path.join(ROOT, "results", name)
+    os.makedirs(out_dir, exist_ok=True)
+    log_bin = os.path.join(out_dir, "log.bin")
+    console = os.path.join(out_dir, "console.txt")
+    cmd = [os.path.join(build, "logger_sim"), "--no-stdin", "--out", log_bin] + args
+    with open(console, "w") as f:
+        rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=1200).returncode
+
+    res = {"name": name, "rc": rc, "rc_ok": rc == expected_rc, "console": console}
+    text = open(console, errors="replace").read()
+
+    m = None
+    for m in re.finditer(r"SUMMARY .*", text):
+        pass
+    if m:
+        res["summary"] = dict((k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", m.group(0)))
+
+    if expected_rc == 0:
+        a = subprocess.run([sys.executable, os.path.join(HERE, "analyze_log.py"), log_bin, console],
+                           capture_output=True, text=True)
+        with open(os.path.join(out_dir, "analysis.txt"), "w") as f:
+            f.write(a.stdout)
+        res["analysis_ok"] = a.returncode == 0
+        g = re.search(r"missing \(gaps\)\s*:\s*(\d+)", a.stdout)
+        res["gaps"] = int(g.group(1)) if g else None
+        r = re.search(r"records ok\s*:\s*(\d+)", a.stdout)
+        res["records"] = int(r.group(1)) if r else None
+    else:
+        fault = re.search(r"FAULT: .* at t=(\d+) ms", text)
+        health = re.search(r"HEALTH: (\w+) heartbeat lost .* at t=(\d+) ms", text)
+        reset = re.search(r"WATCHDOG RESET at t=(\d+) ms", text)
+        res["analysis_ok"] = fault is not None and reset is not None
+        if fault and reset:
+            res["reset_after_ms"] = int(reset.group(1)) - int(fault.group(1))
+        if fault and health:
+            res["detect_after_ms"] = int(health.group(2)) - int(fault.group(1))
+            res["detected_task"] = health.group(1)
+    return res
+
+
+def run_inversion(build, mode, rounds):
+    out = subprocess.run([os.path.join(build, "inversion_demo"), mode, str(rounds)],
+                         capture_output=True, text=True, timeout=600).stdout
+    os.makedirs(os.path.join(ROOT, "results", "inversion"), exist_ok=True)
+    with open(os.path.join(ROOT, "results", "inversion", f"{mode}.txt"), "w") as f:
+        f.write(out)
+    m = re.search(r"high_wait_ms\(min/avg/max\)=(\d+)/([\d.]+)/(\d+) low_prio_while_holding_max=(\d+)", out)
+    return out.strip(), m.groups() if m else None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--build", default=os.path.join(ROOT, "build"))
+    ap.add_argument("--quick", action="store_true")
+    a = ap.parse_args()
+
+    sc = scenarios(a.quick)
+    # 2 at a time: the POSIX port tick slows down a lot if the PC is overloaded
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [ex.submit(run_sim, a.build, n, args, rc) for n, args, rc, _ in sc]
+        results = [f.result() for f in futures]
+
+    inv = {m: run_inversion(a.build, m, 20 if a.quick else 100) for m in ("semaphore", "mutex")}
+
+    lines = ["# Scenario results (generated by tools/run_scenarios.py)", "",
+             "| scenario | what | samples | dropped | seq gaps | written | records in file | queue max | late | check |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    all_ok = True
+    for (name, _, _, desc), r in zip(sc, results):
+        s = r.get("summary", {})
+        ok = r["rc_ok"] and r.get("analysis_ok", False)
+        all_ok = all_ok and ok
+        if "summary" in r:
+            lines.append(f"| {name} | {desc} | {s.get('samples')} | {s.get('dropped')} | {r.get('gaps')} | "
+                         f"{s.get('written')} | {r.get('records')} | {s.get('qmax')} | {s.get('late')} | "
+                         f"{'PASS' if ok else 'FAIL'} |")
+    lines += ["", "| fault | what | detected task | detected after (ms) | watchdog reset after (ms) | check |",
+              "|---|---|---|---|---|---|"]
+    for (name, _, _, desc), r in zip(sc, results):
+        if "summary" not in r:
+            lines.append(f"| {name} | {desc} | {r.get('detected_task', '-')} | {r.get('detect_after_ms', '-')} | "
+                         f"{r.get('reset_after_ms', '-')} | {'PASS' if r['rc_ok'] and r['analysis_ok'] else 'FAIL'} |")
+    lines += ["", "| lock type | high-priority task wait min / avg / max (ms) | LOW task max priority while holding |",
+              "|---|---|---|"]
+    for mode, (_, g) in inv.items():
+        if g:
+            lines.append(f"| {mode} | {g[0]} / {g[1]} / {g[2]} | {g[3]} |")
+        else:
+            all_ok = False
+
+    text = "\n".join(lines) + "\n"
+    os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
+    with open(os.path.join(ROOT, "results", "summary.md"), "w") as f:
+        f.write(text)
+    print(text)
+    print("ALL PASS" if all_ok else "SOME CHECKS FAILED")
+    sys.exit(0 if all_ok else 1)
+
+
+if __name__ == "__main__":
+    main()
